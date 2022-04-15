@@ -38,6 +38,10 @@ class AcousticWaveEquation:
     def writeWaveSpeed(self, run_name):
         paraview_file = dl.File(f'paraview/wave_speed_{run_name}_.pvd')
         paraview_file << self.m, 0
+
+    def writeStatesToNumpy(self, run_name, numpy_states):
+        filename = f'numpy/states_{run_name}.npy'
+        np.save(filename, numpy_states)
         
     def solve(self, dt, final_time, run_name=''):
         # initial condition needs set first
@@ -58,6 +62,10 @@ class AcousticWaveEquation:
         T = 0
         i = 0
         n_steps = int(final_time / dt)
+        
+        numpy_states = np.zeros((n_steps+1, self.u_t.vector().get_local().shape[0]))
+        numpy_states[0, :] = self.u_t.vector().get_local()
+
         for n in range(n_steps):
             A, b = dl.assemble_system(self.lhs, self.rhs, bcs=self.bcs)
             dl.solve(A, self.u_tp1.vector(), b)
@@ -76,7 +84,10 @@ class AcousticWaveEquation:
             self.u_tp1.rename("u", "u")
             paraview_file << self.u_tp1, T
 
+            numpy_states[n+1, :] = self.u_t.vector().get_local()
+
         self.writeWaveSpeed(run_name)
+        self.writeStatesToNumpy(run_name, numpy_states)
         print("100% done")
         return self.u_tp1
 
@@ -87,6 +98,11 @@ class RectangularAnomaly:
         self.speed = speed_perturbation
 
     def checkLimits(self, lims):
+        lims = self.checkLimitsOrder(lims)
+        lims = self.checkLimitsBounds(lims)
+        return lims
+
+    def checkLimitsOrder(self, lims):
         # makes sure upper and lower bounds make sense
         if lims[1] < lims[0]:
             temp = lims[1]
@@ -94,6 +110,15 @@ class RectangularAnomaly:
             lims[0] = temp
         return lims
 
+    def checkLimitsBounds(self, lims):
+        # assume lims is already ordered and that at least
+        # one of lims is within the range [0, 1]
+        if lims[0] < 0.0:
+            lims[0] = 0.0
+        if lims[1] > 1.0:
+            lims[1] = 1.0
+        return lims
+    
     def buildExpressionString(self):
         return f'+({self.speed})*(x[0]>{self.x_lims[0]} && x[0]<{self.x_lims[1]} && x[1]>{self.y_lims[0]} && x[1]<{self.y_lims[1]})'
     
@@ -114,36 +139,40 @@ class WaveSpeedWithAnomalies:
             anomaly_string += anomaly.buildExpressionString()
         return dl.Expression(anomaly_string, degree=5)
 
-def scenariosToRun(problem):
+def anomalyBoundariesFromCWH(center, width, height):
+    # cehcking whether lims are in the domain is done in
+    # RectangularAnomaly class during lim checking
+    x_lims = [center - width, center + width]
+    y_lims = [center - height, center + height]
+    return x_lims, y_lims
+    
+def scenariosToRun(problem, n_draws):
     # define boundary an initial conditions
     def boundary(x, on_boundary):
         return on_boundary
     
     dirichlet = dl.DirichletBC(problem.Vh, dl.Constant(0.0), boundary)
-    possible_bcs = [{ 'name' : 'neumann', 'val' : None},
-                    { 'name' : 'dirichlet', 'val' : dirichlet}]
+    possible_bcs = [{ 'name' : 'neumann', 'val' : None},]
+    #{ 'name' : 'dirichlet', 'val' : dirichlet}]
     scenarios = []
     for bcs in possible_bcs:
-        # wave speed definition with anomalies
-        background = 1.0
-        wave_speed = WaveSpeedWithAnomalies(background)
-        wave_speed.addAnomaly([0.6, 0.9], [0.4, 0.1], 10.0)
-        wave_speed.addAnomaly([0.2, 0.3], [0.7, 0.8], -0.5)
-        problem.setWaveSpeed(wave_speed.buildExpression())
-        scenarios.append({
-            'bcs' : bcs['val'],
-            'wave_speed' : wave_speed,
-            'run_name' : bcs['name'] + '_0'
-        })
-        wave_speed = WaveSpeedWithAnomalies(background)
-        wave_speed.addAnomaly([0.6, 0.9], [0.4, 0.1], -0.5)
-        wave_speed.addAnomaly([0.2, 0.3], [0.7, 0.8], 20.0)
-        problem.setWaveSpeed(wave_speed.buildExpression())
-        scenarios.append({
-            'bcs' : bcs['val'],
-            'wave_speed' : wave_speed,
-            'run_name' : bcs['name'] + '_1'
-        })
+        for n in range(n_draws):
+            # wave speed definition with anomalies
+            background = 1.5
+            wave_speed = WaveSpeedWithAnomalies(background)
+            n_anomalies = np.random.randint(1, 5)
+            for _ in range(n_anomalies):
+                cwh_coords = list(np.random.uniform(0.0, 1.0, 3))
+                speed_perturbation = np.random.uniform(0.0, 10.0)
+                wave_speed.addAnomaly(*anomalyBoundariesFromCWH(*cwh_coords), 10.0)
+                
+            problem.setWaveSpeed(wave_speed.buildExpression())
+            scenarios.append({
+                'bcs' : bcs['val'],
+                'wave_speed' : wave_speed,
+                'run_name' : bcs['name'] + '_' + str(n),
+                'n_anomalies' : n_anomalies,
+            })
     return scenarios
 
 def runScenario(problem, scenario, dt, final_time):
@@ -167,8 +196,9 @@ if __name__ == '__main__':
        
     t_final = 1.0
     dt = 0.001
-    
-    scenarios = scenariosToRun(problem)
+
+    n_scenarios = 20
+    scenarios = scenariosToRun(problem, 20)
     for ind, scenario in enumerate(scenarios, 1):
         print(f'running scenario {ind} / {len(scenarios)}\n   {scenario}\n')
         solution = runScenario(problem, scenario, dt, t_final)
